@@ -427,6 +427,7 @@ class MoERunner(MoERunnerInterface):
         if (
             shared_output is not None
             and not self.moe_config.is_sequence_parallel
+            and not self.moe_config.skip_final_all_reduce
             and self._fused_output_is_reduced
         ):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
@@ -449,6 +450,7 @@ class MoERunner(MoERunnerInterface):
         # - The MK already reduced the fused output itself.
         if (
             not self.moe_config.is_sequence_parallel
+            and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
@@ -613,6 +615,22 @@ class MoERunner(MoERunnerInterface):
         #        separate cuda stream)
         if self._shared_experts is not None and shared_experts_input is not None:
             self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
+
+    def _maybe_add_zero_expert_output(
+        self,
+        result: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the zero expert's contribution to the final result.
+
+        When a ZeroExpertRouter is used, it computes a bias-like output
+        from the "zero expert" that is added to the combined routed+shared
+        expert output.
+        """
+        if isinstance(self.router, ZeroExpertRouter):
+            zero_expert_output = self.router.zero_expert_output
+            if zero_expert_output is not None:
+                result = result + zero_expert_output
+        return result
 
     def forward(
         self,

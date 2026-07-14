@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only LongCat-Next unified multimodal model."""
 
+import contextlib
 import os
 import tempfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -346,6 +347,7 @@ class NgramEmbedding(nn.Module):
                 emb_vocab_dim = int(self.m + index * 2 + 1)
                 # Use VocabParallelEmbedding for TP sharding per embedder
                 self.embedders.append(
+                    VocabParallelEmbedding(
                     Int4VocabParallelEmbedding(
                         emb_vocab_dim,
                         emb_dim_per_embedder,
@@ -477,6 +479,8 @@ class NgramEmbedding(nn.Module):
         # Use isin_list (which uses async_tensor_h2d) instead of
         # torch.tensor(..., device=device) to avoid CPU→GPU transfers that
         # are unsafe inside CUDA graph capture regions.
+        oe_ignored_mask = isin_list(input_ids, self.config.oe_ignored_token_ids)
+        context_ignored_mask = isin_list(context, self.config.oe_ignored_token_ids)
         oe_ignored_mask = isin_list(input_ids,
                                     self.config.oe_ignored_token_ids)
         context_ignored_mask = isin_list(context,
@@ -700,6 +704,126 @@ class LongcatNextTransformerHead(nn.Module):
 # =============================================================================
 # Visual Tower
 # =============================================================================
+
+
+class LongcatNextVisualEncoder(nn.Module):
+    """Visual encoder for LongCat-Next.
+
+    Wraps vLLM's Qwen2_5_VisionTransformer but removes the merger,
+    since LongCat-Next uses OmniVisualBridge instead.
+    Returns hidden_states in window-indexed order.
+    """
+
+    def __init__(
+        self,
+        vision_config: Any,
+        norm_eps: float = 1e-6,
+        quant_config: Any = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionTransformer
+
+        # Create the full vLLM vision transformer (includes merger)
+        self._vision_transformer = Qwen2_5_VisionTransformer(
+            vision_config=vision_config,
+            norm_eps=norm_eps,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+        # Remove the merger since LongCat-Next doesn't use it
+        if hasattr(self._vision_transformer, "merger"):
+            del self._vision_transformer.merger
+
+        # Expose attributes for convenience
+        self.patch_embed = self._vision_transformer.patch_embed
+        self.blocks = self._vision_transformer.blocks
+        self.hidden_size = self._vision_transformer.hidden_size
+        self.num_heads = self._vision_transformer.num_heads
+        self.spatial_merge_size = self._vision_transformer.spatial_merge_size
+        self.spatial_merge_unit = self._vision_transformer.spatial_merge_unit
+        self.fullatt_block_indexes = self._vision_transformer.fullatt_block_indexes
+        self.window_size = self._vision_transformer.window_size
+        self.patch_size = self._vision_transformer.patch_size
+        self.dtype = self._vision_transformer.dtype
+        self.device = self._vision_transformer.device
+
+    def prepare_encoder_metadata(
+        self, grid_thw: list[list[int]]
+    ) -> dict[str, torch.Tensor]:
+        return self._vision_transformer.prepare_encoder_metadata(grid_thw)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: list[list[int]] | None = None,
+        *,
+        encoder_metadata: dict[str, torch.Tensor] | None = None,
+        require_window_index: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = x.to(device=self.device, dtype=self.dtype)
+        hidden_states = self.patch_embed(hidden_states)
+
+        seq_len = hidden_states.shape[0]
+        if encoder_metadata is None:
+            if grid_thw is None:
+                raise ValueError("Either grid_thw or encoder_metadata must be provided")
+            encoder_metadata = self.prepare_encoder_metadata(grid_thw)
+
+        rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
+        rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
+        window_index = encoder_metadata["window_index"]
+        cu_seqlens = encoder_metadata["cu_seqlens"]
+        cu_window_seqlens = encoder_metadata["cu_window_seqlens"]
+        max_seqlen_full = encoder_metadata["max_seqlen_full"]
+        max_seqlen_window = encoder_metadata["max_seqlen_window"]
+        sequence_lengths_full = encoder_metadata.get("sequence_lengths_full")
+        sequence_lengths_window = encoder_metadata.get("sequence_lengths_window")
+
+        hidden_states = hidden_states.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        hidden_states = hidden_states[window_index, :, :]
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        hidden_states = hidden_states.unsqueeze(1)
+
+        for layer_num, blk in enumerate(self.blocks):
+            if layer_num in self.fullatt_block_indexes:
+                cu_seqlens_now = cu_seqlens
+                max_seqlen_now = max_seqlen_full
+                sequence_lengths_now = sequence_lengths_full
+            else:
+                cu_seqlens_now = cu_window_seqlens
+                max_seqlen_now = max_seqlen_window
+                sequence_lengths_now = sequence_lengths_window
+
+            hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens_now,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+                max_seqlen=max_seqlen_now,
+                sequence_lengths=sequence_lengths_now,
+            )
+
+        # Skip merger — squeeze the middle dim instead
+        hidden_states = hidden_states.squeeze(1)
+
+        if require_window_index:
+            return hidden_states, window_index
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights, bridging the `_vision_transformer` wrapper."""
+        stripped_weights = [
+            (name[len("_vision_transformer.") :], loaded_weight)
+            if name.startswith("_vision_transformer.")
+            else (name, loaded_weight)
+            for name, loaded_weight in weights
+        ]
+        loaded = self._vision_transformer.load_weights(stripped_weights)
+        return {f"_vision_transformer.{n}" for n in loaded}
 
 
 class MLP(nn.Module):
@@ -1003,6 +1127,7 @@ class LongcatNextVisualTokenizer(nn.Module):
         self.config = config
 
         # Visual encoder (Qwen2.5-VL style ViT without merger)
+        self.visual_model = LongcatNextVisualEncoder(
         from vllm.model_executor.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 
         self.visual_model = Qwen2_5_VisionTransformer(
@@ -1034,6 +1159,10 @@ class LongcatNextVisualTokenizer(nn.Module):
             Visual token indices of shape [num_tokens, depth]
         """
         # Prepare encoder metadata to get window_index
+        encoder_metadata = self.visual_model.prepare_encoder_metadata(grid_thw.tolist())
+        window_index = encoder_metadata["window_index"]
+
+        # Run visual encoder (LongcatNextVisualEncoder returns window-indexed output)
         encoder_metadata = self.visual_model.prepare_encoder_metadata(
             grid_thw.tolist()
         )
@@ -1146,6 +1275,8 @@ class LongcatNextWhisperEncoder(WhisperEncoder):
             embeds = nn.functional.gelu(self.conv2(embeds))
             embeds = embeds.transpose(-1, -2)  # [seq_len, d_model]
             # Match original: float32 addition for numerical precision
+            pos_embed = self.embed_positions.weight[: embeds.size(0)]
+            embeds = (embeds.float() + pos_embed).to(embeds.dtype)
             embeds = (embeds.float() + self.embed_positions.weight[: embeds.size(0)]).to(
                 embeds.dtype
             )
@@ -1194,6 +1325,7 @@ class LongcatNextWhisperEncoder(WhisperEncoder):
             for i in range(bs):
                 start = int(cu_seqlens_cpu[i])
                 end = int(cu_seqlens_cpu[i + 1])
+                result[i, : end - start] = packed_hidden[start:end]
                 result[i, :end - start] = packed_hidden[start:end]
             # Padded positions remain zero (implicit mask)
         else:
@@ -1246,6 +1378,7 @@ class LongcatNextWhisperEncoder(WhisperEncoder):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader = getattr(
                     param, "weight_loader", default_weight_loader
                 )
@@ -1255,6 +1388,7 @@ class LongcatNextWhisperEncoder(WhisperEncoder):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader = getattr(
                     param, "weight_loader", default_weight_loader
                 )
@@ -1835,6 +1969,8 @@ class LongcatNextMultiModalProcessor(
             finally:
                 # Clean up all temporary files
                 for path in audio_paths:
+                    with contextlib.suppress(OSError):
+                        os.unlink(path)
                     try:
                         os.unlink(path)
                     except OSError:
@@ -2252,6 +2388,10 @@ class LongcatNextForCausalLM(
 
         # Configure multimodal token handling
         # CRITICAL: Use text_vocab_size (131072), NOT vocab_size (282624).
+        # All multimodal tokens (131103-131109, 131116, 131120-131124) are
+        # >= text_vocab_size, so _has_oov_mm_tokens becomes True. This causes
+        # _embed_text_input_ids to mask them to 0 BEFORE ngram embedding,
+        # matching the HF model which explicitly zeroes them at line 153:
         # All multimodal tokens (131103-131109, 131116, 131120-131124) are >= text_vocab_size, so
         # _has_oov_mm_tokens becomes True. This causes _embed_text_input_ids
         # to mask them to 0 BEFORE ngram embedding, matching the HF model
@@ -2321,6 +2461,7 @@ class LongcatNextForCausalLM(
 
             # Audio Tower
             with self._mark_tower_model(vllm_config, "audio"):
+                self.audio_tower = self._build_audio_tower(config, vllm_config, prefix)
                 self.audio_tower = self._build_audio_tower(
                     config, vllm_config, prefix
                 )
